@@ -20,7 +20,6 @@
 #include "hwctrace.h"
 #include "nativesurface.h"
 #include "renderstate.h"
-#include "scopedrendererstate.h"
 #include "shim.h"
 
 namespace hwcomposer {
@@ -37,13 +36,6 @@ bool GLRenderer::Init() {
   // clang-format on
   if (!context_.Init()) {
     ETRACE("Failed to initialize EGLContext.");
-    return false;
-  }
-
-  ScopedRendererState state(this);
-
-  if (!state.IsValid()) {
-    ETRACE("Failed to initialize GLRenderer.");
     return false;
   }
 
@@ -114,14 +106,6 @@ bool GLRenderer::Draw(const std::vector<RenderState> &render_states,
     surface->SetNativeFence(context_.GetSyncFD());
 
   return true;
-}
-
-void GLRenderer::RestoreState() {
-  context_.RestoreState();
-}
-
-bool GLRenderer::MakeCurrent() {
-  return context_.MakeCurrent();
 }
 
 void GLRenderer::InsertFence(uint64_t kms_fence) {

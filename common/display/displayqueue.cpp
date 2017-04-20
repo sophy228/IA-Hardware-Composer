@@ -19,6 +19,7 @@
 #include <math.h>
 #include <hwcdefs.h>
 #include <hwclayer.h>
+#include "hwcutils.h"
 
 #include <vector>
 
@@ -32,7 +33,8 @@ namespace hwcomposer {
 
 DisplayQueue::DisplayQueue(uint32_t gpu_fd, uint32_t crtc_id,
                            OverlayBufferManager* buffer_manager)
-    : frame_(0),
+    : HWCThread(-8, "DisplayQueue"),
+      frame_(0),
       dpms_prop_(0),
       out_fence_ptr_prop_(0),
       active_prop_(0),
@@ -63,7 +65,6 @@ DisplayQueue::DisplayQueue(uint32_t gpu_fd, uint32_t crtc_id,
   display_plane_manager_.reset(
       new DisplayPlaneManager(gpu_fd_, crtc_id_, buffer_manager_));
 
-  kms_fence_handler_.reset(new KMSFenceEventHandler(this));
   /* use 0x80 as default brightness for all colors */
   brightness_ = 0x808080;
   /* use 0x80 as default brightness for all colors */
@@ -179,9 +180,11 @@ bool DisplayQueue::SetPowerMode(uint32_t power_mode) {
       HandleExit();
       break;
     case kDoze:
+      Flush();
       HandleExit();
       break;
     case kDozeSuspend:
+      Flush();
       break;
     case kOn:
       needs_modeset_ = true;
@@ -189,9 +192,10 @@ bool DisplayQueue::SetPowerMode(uint32_t power_mode) {
       flags_ = DRM_MODE_ATOMIC_ALLOW_MODESET;
       drmModeConnectorSetProperty(gpu_fd_, connector_, dpms_prop_,
                                   DRM_MODE_DPMS_ON);
-
-      if (!kms_fence_handler_->Initialize())
+      if (!InitWorker()) {
+        ETRACE("Failed to initalize thread for DisplayQueue. %s", PRINTERROR());
         return false;
+      }
       break;
     default:
       break;
@@ -245,17 +249,28 @@ void DisplayQueue::GetCachedLayers(const std::vector<OverlayLayer>& layers,
 bool DisplayQueue::QueueUpdate(std::vector<HwcLayer*>& source_layers,
                                int32_t* retire_fence) {
   CTRACE();
+  ScopedSpinLock lock(display_queue_);
+  queue_.emplace();
+  DisplayQueueItem& queue_item = queue_.back();
   size_t size = source_layers.size();
   size_t previous_size = previous_layers_.size();
-  std::vector<OverlayLayer> layers;
-  std::vector<HwcRect<int>> layers_rects;
+  queue_item.sync_object_.reset(new NativeSync());
   bool layers_changed = false;
-  spin_lock_.lock();
+
+  if (needs_color_correction_) {
+    queue_item.brightness_ = brightness_;
+    queue_item.contrast_ = contrast_;
+    queue_item.gamma_.red = gamma_.red;
+    queue_item.gamma_.green = gamma_.green;
+    queue_item.gamma_.blue = gamma_.blue;
+    queue_item.needs_color_correction_ = needs_color_correction_;
+    needs_color_correction_ = false;
+  }
+
   for (size_t layer_index = 0; layer_index < size; layer_index++) {
     HwcLayer* layer = source_layers.at(layer_index);
-    const HwcRegion& current_surface_damage = layer->GetSurfaceDamage();
-    layers.emplace_back();
-    OverlayLayer& overlay_layer = layers.back();
+    queue_item.layers_.emplace_back();
+    OverlayLayer& overlay_layer = queue_item.layers_.back();
     overlay_layer.SetTransform(layer->GetTransform());
     overlay_layer.SetAlpha(layer->GetAlpha());
     overlay_layer.SetBlending(layer->GetBlending());
@@ -263,7 +278,7 @@ bool DisplayQueue::QueueUpdate(std::vector<HwcLayer*>& source_layers,
     overlay_layer.SetDisplayFrame(layer->GetDisplayFrame());
     overlay_layer.SetIndex(layer_index);
     overlay_layer.SetAcquireFence(layer->acquire_fence.Release());
-    layers_rects.emplace_back(layer->GetDisplayFrame());
+    queue_item.layers_rects_.emplace_back(layer->GetDisplayFrame());
     ImportedBuffer* buffer =
         buffer_manager_->CreateBufferFromNativeHandle(layer->GetNativeHandle());
     overlay_layer.SetBuffer(buffer);
@@ -271,10 +286,11 @@ bool DisplayQueue::QueueUpdate(std::vector<HwcLayer*>& source_layers,
     if (ret < 0)
       ETRACE("Failed to create fence for layer, error: %s", PRINTERROR());
 
-    if (!use_layer_cache_)
+    if (!use_layer_cache_ || layers_changed)
       continue;
 
     if (previous_size > layer_index) {
+      const HwcRegion& current_surface_damage = layer->GetSurfaceDamage();
       overlay_layer.SetSurfaceDamage(current_surface_damage,
                                      previous_layers_.at(layer_index));
     }
@@ -284,42 +300,85 @@ bool DisplayQueue::QueueUpdate(std::vector<HwcLayer*>& source_layers,
     }
   }
 
-  spin_lock_.unlock();
-
   if (!use_layer_cache_ || size != previous_size) {
     layers_changed = true;
   }
 
+  queue_item.flags_ = flags_;
+
   if (needs_modeset_) {
+    queue_item.needs_modeset_ = needs_modeset_;
+    needs_modeset_ = false;
     layers_changed = true;
     use_layer_cache_ = false;
+
+    if (!disable_overlay_usage_) {
+      flags_ = 0;
+      flags_ |= DRM_MODE_ATOMIC_NONBLOCK;
+    }
   } else {
     use_layer_cache_ = true;
   }
 
+  queue_item.flags_ = flags_;
+  queue_item.disable_overlay_usage_ = disable_overlay_usage_;
+  queue_item.layers_changed_ = layers_changed;
+
+  *retire_fence = queue_item.sync_object_->CreateNextTimelineFence();
+
+  Resume();
+  return true;
+}
+
+void DisplayQueue::GetNextQueueItem(DisplayQueueItem& item) {
+  DisplayQueueItem& queue_item = queue_.front();
+  item.layers_.swap(queue_item.layers_);
+  item.layers_rects_.swap(queue_item.layers_rects_);
+  if (queue_item.needs_color_correction_) {
+    item.brightness_ = queue_item.brightness_;
+    item.contrast_ = queue_item.contrast_;
+    item.gamma_.red = queue_item.gamma_.red;
+    item.gamma_.green = queue_item.gamma_.green;
+    item.gamma_.blue = queue_item.gamma_.blue;
+    item.needs_color_correction_ = false;
+  }
+
+  item.needs_modeset_ = queue_item.needs_modeset_;
+  item.sync_object_.reset(queue_item.sync_object_.release());
+  item.layers_changed_ = queue_item.layers_changed_;
+  item.disable_overlay_usage_ = queue_item.disable_overlay_usage_;
+  queue_.pop();
+}
+
+void DisplayQueue::HandleUpdateRequest(DisplayQueueItem& queue_item) {
+  CTRACE();
+
   DisplayPlaneStateList current_composition_planes;
   bool render_layers;
   // Validate Overlays and Layers usage.
-  if (!layers_changed) {
-    GetCachedLayers(layers, &current_composition_planes, &render_layers);
+  if (!queue_item.layers_changed_) {
+    GetCachedLayers(queue_item.layers_, &current_composition_planes,
+                    &render_layers);
   } else {
     std::tie(render_layers, current_composition_planes) =
-        display_plane_manager_->ValidateLayers(layers, needs_modeset_,
-                                               disable_overlay_usage_);
+        display_plane_manager_->ValidateLayers(
+            queue_item.layers_, queue_item.needs_modeset_,
+            queue_item.disable_overlay_usage_);
   }
 
   DUMP_CURRENT_COMPOSITION_PLANES();
 
-  if (render_layers) {
-      if (!compositor_.BeginFrame(disable_overlay_usage_)) {
-	ETRACE("Failed to initialize compositor.");
-	return false;
-      }
+  if (!compositor_.BeginFrame(queue_item.disable_overlay_usage_)) {
+    ETRACE("Failed to initialize compositor.");
+    return;
+  }
 
+  if (render_layers) {
     // Prepare for final composition.
-    if (!compositor_.Draw(current_composition_planes, layers, layers_rects)) {
+    if (!compositor_.Draw(current_composition_planes, queue_item.layers_,
+                          queue_item.layers_rects_)) {
       ETRACE("Failed to prepare for the frame composition. ");
-      return false;
+      return;
     }
   }
 
@@ -329,82 +388,111 @@ bool DisplayQueue::QueueUpdate(std::vector<HwcLayer*>& source_layers,
 
   if (!pset) {
     ETRACE("Failed to allocate property set %d", -ENOMEM);
-    return false;
+    return;
   }
 
-  if (needs_modeset_) {
+  if (queue_item.needs_modeset_) {
     if (!ApplyPendingModeset(pset.get())) {
       ETRACE("Failed to Modeset.");
-      return false;
+      return;
     }
-  } else if (!disable_overlay_usage_) {
+  } else {
     GetFence(pset.get(), &fence);
   }
 
-  if (needs_color_correction_) {
-    SetColorCorrection(gamma_, contrast_, brightness_);
-    needs_color_correction_ = false;
+  if (queue_item.needs_color_correction_) {
+    SetColorCorrection(queue_item.gamma_, queue_item.contrast_,
+                       queue_item.brightness_);
   }
-
-  kms_fence_handler_->EnsureReadyForNextFrame();
 
   if (!display_plane_manager_->CommitFrame(current_composition_planes,
-                                           pset.get(), flags_)) {
+                                           pset.get(), queue_item.flags_)) {
     ETRACE("Failed to Commit layers.");
-    return false;
+    return;
   }
+
+  current_layers_.swap(queue_item.layers_);
+  current_plane_state_.swap(current_composition_planes);
+  sync_object_.reset(queue_item.sync_object_.release());
 
   if (fence > 0) {
-    if (render_layers)
-      compositor_.InsertFence(dup(fence));
-    *retire_fence = dup(fence);
-    kms_fence_handler_->WaitFence(fence, previous_layers_);
+    compositor_.InsertFence(dup(fence));
+    fd_handler_.AddFd(fence);
+    out_fence_.Reset(fence);
   } else {
-    // This is the best we can do in this case, flush any 3D
-    // operations and release buffers of previous layers.
-    if (render_layers)
-      compositor_.InsertFence(fence);
-
-    spin_lock_.lock();
+    compositor_.InsertFence(fence);
+    display_queue_.lock();
     buffer_manager_->UnRegisterLayerBuffers(previous_layers_);
-    spin_lock_.unlock();
-    if (!disable_overlay_usage_) {
-      flags_ = 0;
-      flags_ |= DRM_MODE_ATOMIC_NONBLOCK;
-    }
+    display_queue_.unlock();
+    CommitFinished();
+  }
+}
 
-    needs_modeset_ = false;
+void DisplayQueue::ProcessRequests() {
+  display_queue_.lock();
+  size_t size = queue_.size();
+
+  if (size <= 0) {
+    display_queue_.unlock();
+    return;
   }
 
-  for (NativeSurface* surface : in_flight_surfaces_) {
-    surface->SetInUse(false);
-  }
+  DisplayQueueItem item;
 
-  previous_layers_.swap(layers);
-  previous_plane_state_.swap(current_composition_planes);
+  GetNextQueueItem(item);
+  display_queue_.unlock();
 
-  std::vector<NativeSurface*>().swap(in_flight_surfaces_);
+  HandleUpdateRequest(item);
+}
 
+void DisplayQueue::CommitFinished() {
+  fd_handler_.RemoveFd(out_fence_.get());
+  out_fence_.Reset(-1);
   for (DisplayPlaneState& plane_state : previous_plane_state_) {
     if (plane_state.GetCompositionState() ==
         DisplayPlaneState::State::kRender) {
-      in_flight_surfaces_.emplace_back(plane_state.GetOffScreenTarget());
+      plane_state.GetOffScreenTarget()->SetInUse(false);
     }
   }
 
-  return true;
+  previous_layers_.swap(current_layers_);
+  previous_plane_state_.swap(current_plane_state_);
+  previous_sync_object_.reset(sync_object_.release());
 }
 
-void DisplayQueue::HandleCommitUpdate(
-    const std::vector<const OverlayBuffer*>& buffers) {
-  spin_lock_.lock();
-  buffer_manager_->UnRegisterBuffers(buffers);
-  spin_lock_.unlock();
+void DisplayQueue::HandleRoutine() {
+  // If we have a commit pending and the out_fence_ is ready, we can process
+  // the end of the last commit.
+  int fd = out_fence_.get();
+  if (fd > 0 && fd_handler_.IsReady(fd)) {
+    display_queue_.lock();
+    buffer_manager_->UnRegisterLayerBuffers(previous_layers_);
+    display_queue_.unlock();
+    CommitFinished();
+  }
+
+  // Do not submit another commit while there is one still pending.
+  if (out_fence_.get() > 0)
+    return;
+
+  // Check whether there are more requests to process, and commit the first
+  // one.
+  ProcessRequests();
+}
+
+void DisplayQueue::Flush() {
+  ScopedSpinLock lock(display_queue_);
+
+  while (queue_.size()) {
+    DisplayQueueItem item;
+
+    GetNextQueueItem(item);
+    HandleUpdateRequest(item);
+  }
 }
 
 void DisplayQueue::HandleExit() {
-  kms_fence_handler_->ExitThread();
-
+  ScopedSpinLock lock(display_queue_);
   ScopedDrmAtomicReqPtr pset(drmModeAtomicAlloc());
   if (!pset) {
     ETRACE("Failed to allocate property set %d", -ENOMEM);
@@ -418,14 +506,16 @@ void DisplayQueue::HandleExit() {
     ETRACE("Failed to set display to inactive");
     return;
   }
-
-  std::vector<NativeSurface*>().swap(in_flight_surfaces_);
   display_plane_manager_->DisablePipe(pset.get());
   drmModeConnectorSetProperty(gpu_fd_, connector_, dpms_prop_,
                               DRM_MODE_DPMS_OFF);
-  std::vector<OverlayLayer>().swap(previous_layers_);
+  buffer_manager_->UnRegisterLayerBuffers(previous_layers_);
+  previous_layers_.clear();
   previous_plane_state_.clear();
+  std::queue<DisplayQueueItem>().swap(queue_);
   compositor_.Reset();
+  buffer_manager_->UnRegisterLayerBuffers(previous_layers_);
+  CommitFinished();
 }
 
 void DisplayQueue::GetDrmObjectProperty(const char* name,

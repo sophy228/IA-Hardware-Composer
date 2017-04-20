@@ -34,18 +34,9 @@ class EGLOffScreenContext {
     return egl_display_;
   }
 
-  bool MakeCurrent();
-
-  void RestoreState();
-
  private:
   EGLDisplay egl_display_;
   EGLContext egl_ctx_;
-  EGLDisplay saved_egl_display_ = EGL_NO_DISPLAY;
-  EGLContext saved_egl_ctx_ = EGL_NO_CONTEXT;
-  EGLSurface saved_egl_read_ = EGL_NO_SURFACE;
-  EGLSurface saved_egl_draw_ = EGL_NO_SURFACE;
-  bool restore_context_;
 };
 
 }  // namespace hwcomposer
