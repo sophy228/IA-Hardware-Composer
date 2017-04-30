@@ -22,20 +22,23 @@
 #include <nativedisplay.h>
 #include <spinlock.h>
 
+#include <vector>
 #include <memory>
 
 #include "hwcthread.h"
+#include "overlaylayer.h"
 
 namespace hwcomposer {
 
+class DisplayQueue;
+
 class VblankEventHandler : public HWCThread {
  public:
-  VblankEventHandler();
+  VblankEventHandler(DisplayQueue* display_queue);
   ~VblankEventHandler() override;
 
   void Init(float refresh, int fd, int pipe);
-
-  bool SetPowerMode(uint32_t power_mode);
+  bool Initialize();
 
   void HandlePageFlipEvent(unsigned int sec, unsigned int usec);
 
@@ -44,9 +47,14 @@ class VblankEventHandler : public HWCThread {
 
   int VSyncControl(bool enabled);
 
+  void WaitFence(uint64_t kms_fence, std::vector<OverlayLayer>& layers);
+  bool EnsureReadyForNextFrame();
+  void ExitThread();
+
  protected:
   void HandleRoutine() override;
   void HandleWait() override;
+  void HandleExit() override;
 
  private:
   // shared_ptr since we need to use this outside of the thread lock (to
@@ -54,13 +62,18 @@ class VblankEventHandler : public HWCThread {
   // done
   std::shared_ptr<VsyncCallback> callback_ = NULL;
   SpinLock spin_lock_;
+  SpinLock vblank_lock_;
   uint32_t display_;
   bool enabled_;
+  bool handle_fence_;
 
   float refresh_;
   int fd_;
   int pipe_;
   int64_t last_timestamp_;
+  uint64_t kms_fence_;
+  DisplayQueue* display_queue_;
+  std::vector<const OverlayBuffer*> buffers_;
 };
 
 }  // namespace hwcomposer

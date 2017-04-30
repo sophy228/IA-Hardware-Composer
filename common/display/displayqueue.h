@@ -30,10 +30,11 @@
 #include <vector>
 
 #include "compositor.h"
+#include "display.h"
 #include "hwcthread.h"
-#include "kmsfencehandler.h"
 #include "nativesync.h"
 #include "platformdefines.h"
+#include "vblankeventhandler.h"
 
 namespace hwcomposer {
 struct gamma_colors {
@@ -53,7 +54,8 @@ class DisplayQueue {
   ~DisplayQueue();
 
   bool Initialize(uint32_t width, uint32_t height, uint32_t pipe,
-                  uint32_t connector, const drmModeModeInfo& mode_info);
+                  uint32_t connector, float refresh,
+                  const drmModeModeInfo& mode_info);
 
   bool QueueUpdate(std::vector<HwcLayer*>& source_layers,
                    int32_t* retire_fence);
@@ -68,6 +70,11 @@ class DisplayQueue {
   void HandleExit();
 
   void HandleCommitUpdate(const std::vector<const OverlayBuffer*>& buffers);
+
+  int RegisterVsyncCallback(std::shared_ptr<VsyncCallback> callback,
+                            uint32_t display_id);
+
+  void VSyncControl(bool enabled);
 
  private:
   bool ApplyPendingModeset(drmModeAtomicReqPtr property_set);
@@ -116,7 +123,7 @@ class DisplayQueue {
   bool use_layer_cache_ = false;
   bool needs_modeset_ = true;
   bool disable_overlay_usage_ = false;
-  std::unique_ptr<KMSFenceEventHandler> kms_fence_handler_;
+  std::unique_ptr<VblankEventHandler> vblank_handler_;
   std::unique_ptr<DisplayPlaneManager> display_plane_manager_;
   std::vector<OverlayLayer> previous_layers_;
   DisplayPlaneStateList previous_plane_state_;

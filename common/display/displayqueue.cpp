@@ -63,7 +63,7 @@ DisplayQueue::DisplayQueue(uint32_t gpu_fd, uint32_t crtc_id,
   display_plane_manager_.reset(
       new DisplayPlaneManager(gpu_fd_, crtc_id_, buffer_manager_));
 
-  kms_fence_handler_.reset(new KMSFenceEventHandler(this));
+  vblank_handler_.reset(new VblankEventHandler(this));
   /* use 0x80 as default brightness for all colors */
   brightness_ = 0x808080;
   /* use 0x80 as default brightness for all colors */
@@ -84,11 +84,13 @@ DisplayQueue::~DisplayQueue() {
 }
 
 bool DisplayQueue::Initialize(uint32_t width, uint32_t height, uint32_t pipe,
-                              uint32_t connector,
+                              uint32_t connector, float refresh,
                               const drmModeModeInfo& mode_info) {
   frame_ = 0;
   previous_layers_.clear();
   previous_plane_state_.clear();
+
+  vblank_handler_->Init(refresh, gpu_fd_, pipe);
 
   if (!display_plane_manager_->Initialize(pipe, width, height)) {
     ETRACE("Failed to initialize DisplayQueue Manager.");
@@ -190,7 +192,7 @@ bool DisplayQueue::SetPowerMode(uint32_t power_mode) {
       drmModeConnectorSetProperty(gpu_fd_, connector_, dpms_prop_,
                                   DRM_MODE_DPMS_ON);
 
-      if (!kms_fence_handler_->Initialize())
+      if (!vblank_handler_->Initialize())
         return false;
       break;
     default:
@@ -346,7 +348,7 @@ bool DisplayQueue::QueueUpdate(std::vector<HwcLayer*>& source_layers,
     needs_color_correction_ = false;
   }
 
-  kms_fence_handler_->EnsureReadyForNextFrame();
+  vblank_handler_->EnsureReadyForNextFrame();
 
   if (!display_plane_manager_->CommitFrame(current_composition_planes,
                                            pset.get(), flags_)) {
@@ -358,7 +360,7 @@ bool DisplayQueue::QueueUpdate(std::vector<HwcLayer*>& source_layers,
     if (render_layers)
       compositor_.InsertFence(dup(fence));
     *retire_fence = dup(fence);
-    kms_fence_handler_->WaitFence(fence, previous_layers_);
+    vblank_handler_->WaitFence(fence, previous_layers_);
   } else {
     // This is the best we can do in this case, flush any 3D
     // operations and release buffers of previous layers.
@@ -403,7 +405,7 @@ void DisplayQueue::HandleCommitUpdate(
 }
 
 void DisplayQueue::HandleExit() {
-  kms_fence_handler_->ExitThread();
+  vblank_handler_->ExitThread();
 
   ScopedDrmAtomicReqPtr pset(drmModeAtomicAlloc());
   if (!pset) {
@@ -626,6 +628,15 @@ void DisplayQueue::SetExplicitSyncSupport(bool disable_explicit_sync) {
   } else {
     disable_overlay_usage_ = out_fence_ptr_prop_ == 0;
   }
+}
+
+int DisplayQueue::RegisterVsyncCallback(std::shared_ptr<VsyncCallback> callback,
+                                        uint32_t display_id) {
+  return vblank_handler_->RegisterCallback(callback, display_id);
+}
+
+void DisplayQueue::VSyncControl(bool enabled) {
+  vblank_handler_->VSyncControl(enabled);
 }
 
 }  // namespace hwcomposer

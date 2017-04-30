@@ -21,56 +21,99 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
-#include <memory>
-
+#include "displayqueue.h"
+#include "hwcutils.h"
 #include "hwctrace.h"
 
 namespace hwcomposer {
 
 static const int64_t kOneSecondNs = 1 * 1000 * 1000 * 1000;
 
-VblankEventHandler::VblankEventHandler()
+VblankEventHandler::VblankEventHandler(DisplayQueue* display_queue)
     : HWCThread(-8, "VblankEventHandler"),
       display_(0),
       enabled_(false),
       refresh_(0.0),
       fd_(-1),
       pipe_(-1),
-      last_timestamp_(-1) {
+      last_timestamp_(-1),
+      kms_fence_(0),
+      display_queue_(display_queue) {
 }
 
 VblankEventHandler::~VblankEventHandler() {
 }
 
 void VblankEventHandler::Init(float refresh, int fd, int pipe) {
-  ScopedSpinLock lock(spin_lock_);
+  spin_lock_.lock();
   refresh_ = refresh;
   fd_ = fd;
   pipe_ = pipe;
+  spin_lock_.unlock();
 }
 
-bool VblankEventHandler::SetPowerMode(uint32_t power_mode) {
-  if (power_mode == kOn && enabled_) {
-    VSyncControl(enabled_);
-  } else {
-    Exit();
+bool VblankEventHandler::Initialize() {
+  if (!InitWorker()) {
+    ETRACE("Failed to initalize thread for KMSFenceEventHandler. %s",
+           PRINTERROR());
+    return false;
   }
 
   return true;
 }
 
+bool VblankEventHandler::EnsureReadyForNextFrame() {
+  CTRACE();
+  // Lets ensure the job associated with previous frame
+  // has been done, else commit will fail with -EBUSY.
+  spin_lock_.lock();
+  uint64_t kms_fence = kms_fence_;
+  kms_fence_ = 0;
+  spin_lock_.unlock();
+
+  if (kms_fence > 0) {
+    HWCPoll(kms_fence, -1);
+    close(kms_fence);
+    display_queue_->HandleCommitUpdate(buffers_);
+    std::vector<const OverlayBuffer*>().swap(buffers_);
+  }
+
+  return true;
+}
+
+void VblankEventHandler::WaitFence(uint64_t kms_fence,
+                                   std::vector<OverlayLayer>& layers) {
+  CTRACE();
+  spin_lock_.lock();
+  kms_fence_ = kms_fence;
+  for (OverlayLayer& layer : layers) {
+    OverlayBuffer* const buffer = layer.GetBuffer();
+    buffers_.emplace_back(buffer);
+    // Instead of registering again, we mark the buffer
+    // released in layer so that it's not deleted till we
+    // explicitly unregister the buffer.
+    layer.ReleaseBuffer();
+  }
+
+  spin_lock_.unlock();
+}
+
+void VblankEventHandler::ExitThread() {
+  HWCThread::Exit();
+}
+
+void VblankEventHandler::HandleExit() {
+  EnsureReadyForNextFrame();
+}
+
+
 int VblankEventHandler::RegisterCallback(
     std::shared_ptr<VsyncCallback> callback, uint32_t display) {
-  spin_lock_.lock();
+  vblank_lock_.lock();
   callback_ = callback;
   display_ = display;
   last_timestamp_ = -1;
-  spin_lock_.unlock();
-
-  if (!InitWorker()) {
-    ETRACE("Failed to initalize thread for VblankEventHandler. %s",
-           PRINTERROR());
-  }
+  vblank_lock_.unlock();
 
   return 0;
 }
@@ -80,25 +123,17 @@ int VblankEventHandler::VSyncControl(bool enabled) {
   if (enabled_ == enabled)
     return 0;
 
-  ScopedSpinLock lock(spin_lock_);
+  vblank_lock_.lock();
   enabled_ = enabled;
-  if (enabled_ && callback_) {
-    if (!InitWorker()) {
-      ETRACE("Failed to initalize thread for VblankEventHandler. %s",
-             PRINTERROR());
-    }
-  } else {
-    Exit();
-  }
-
   last_timestamp_ = -1;
+  vblank_lock_.unlock();
 
   return 0;
 }
 
 void VblankEventHandler::HandlePageFlipEvent(unsigned int sec,
                                              unsigned int usec) {
-  ScopedSpinLock lock(spin_lock_);
+  ScopedSpinLock lock(vblank_lock_);
   if (!enabled_ || !callback_)
     return;
 
@@ -116,16 +151,20 @@ void VblankEventHandler::HandleWait() {
 }
 
 void VblankEventHandler::HandleRoutine() {
-  spin_lock_.lock();
+  CTRACE();
+  vblank_lock_.lock();
 
   bool enabled = enabled_;
   int fd = fd_;
   int pipe = pipe_;
 
-  spin_lock_.unlock();
+  vblank_lock_.unlock();
 
-  if (!enabled)
+  if (!enabled) {
+    EnsureReadyForNextFrame();
+
     return;
+  }
 
   uint32_t high_crtc = (pipe << DRM_VBLANK_HIGH_CRTC_SHIFT);
 
@@ -138,6 +177,8 @@ void VblankEventHandler::HandleRoutine() {
   int ret = drmWaitVBlank(fd, &vblank);
   if (!ret)
     HandlePageFlipEvent(vblank.reply.tval_sec, (int64_t)vblank.reply.tval_usec);
+
+  EnsureReadyForNextFrame();
 }
 
 }  // namespace hwcomposer
